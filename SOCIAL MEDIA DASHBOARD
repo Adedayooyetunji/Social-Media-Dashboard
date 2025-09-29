@@ -1,0 +1,169 @@
+# main.py
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime
+import uuid
+import logging
+
+# DB & scheduler imports
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, JSON, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from apscheduler.schedulers.background import BackgroundScheduler
+
+# Sentiment
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+# import fetchers (below) - they are local modules
+from fetchers import twitter_fetcher, reddit_fetcher, instagram_fetcher
+
+# ---------- CONFIG ----------
+DATABASE_URL = "sqlite:///./social_agg.db"  # swap to postgres in prod
+FETCH_INTERVAL_SECONDS = 60  # how often to poll each API (example)
+# ----------------------------
+
+logging.basicConfig(level=logging.INFO)
+analyzer = SentimentIntensityAnalyzer()
+
+# ---------- DB setup ----------
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+Base = declarative_base()
+SessionLocal = sessionmaker(bind=engine)
+
+class Post(Base):
+    _tablename_ = "posts"
+    id = Column(String, primary_key=True, index=True)
+    source = Column(String, index=True)           # twitter / reddit / instagram
+    author = Column(String, index=True)
+    text = Column(Text)
+    timestamp = Column(DateTime, index=True)
+    metrics = Column(JSON)                        # likes, comments, shares
+    raw = Column(JSON)                            # raw payload for debugging
+    sentiment = Column(String, index=True)
+
+Base.metadata.create_all(bind=engine)
+# -----------------------------
+
+app = FastAPI(title="Social Aggregator API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------- Pydantic schemas ----------
+class PostOut(BaseModel):
+    id: str
+    source: str
+    author: str
+    text: str
+    timestamp: datetime
+    metrics: dict
+    sentiment: Optional[str]
+
+# ---------- Normalization helper ----------
+def normalize_and_store(items: List[dict], source: str):
+    """
+    items: list of normalized dicts {id, author, text, timestamp (iso), metrics, raw}
+    """
+    db = SessionLocal()
+    created = 0
+    for it in items:
+        # compute sentiment
+        score = analyzer.polarity_scores(it["text"])
+        sentiment = "positive" if score["compound"] >= 0.05 else "negative" if score["compound"] <= -0.05 else "neutral"
+        pid = f"{source}_{it['id']}"
+        exists = db.query(Post).filter(Post.id == pid).first()
+        if exists:
+            # optionally update metrics/timestamp
+            continue
+        post = Post(
+            id=pid,
+            source=source,
+            author=it.get("author"),
+            text=it.get("text"),
+            timestamp=datetime.fromisoformat(it.get("timestamp")),
+            metrics=it.get("metrics", {}),
+            raw=it.get("raw", {}),
+            sentiment=sentiment
+        )
+        db.add(post)
+        created += 1
+    db.commit()
+    db.close()
+    logging.info(f"Stored {created} new posts from {source}")
+
+# ---------- Aggregation job ----------
+def do_fetch_cycle():
+    logging.info("Starting fetch cycle")
+    try:
+        tw = twitter_fetcher.fetch_recent(query="AI OR python", limit=20)
+        normalize_and_store(tw, "twitter")
+    except Exception as e:
+        logging.exception("Twitter fetch failed: %s", e)
+
+    try:
+        rd = reddit_fetcher.fetch_hot(subreddit="technology", limit=20)
+        normalize_and_store(rd, "reddit")
+    except Exception as e:
+        logging.exception("Reddit fetch failed: %s", e)
+
+    try:
+        ig = instagram_fetcher.fetch_recent(limit=20)
+        normalize_and_store(ig, "instagram")
+    except Exception as e:
+        logging.exception("Instagram fetch failed: %s", e)
+
+# ---------- Scheduler ----------
+scheduler = BackgroundScheduler()
+scheduler.add_job(do_fetch_cycle, 'interval', seconds=FETCH_INTERVAL_SECONDS, id="fetcher_job", max_instances=1)
+scheduler.start()
+
+# ---------- API endpoints ----------
+@app.get("/posts", response_model=List[PostOut])
+def list_posts(source: Optional[str] = None, limit: int = 50, offset: int = 0):
+    db = SessionLocal()
+    q = db.query(Post)
+    if source:
+        q = q.filter(Post.source == source)
+    q = q.order_by(Post.timestamp.desc()).offset(offset).limit(limit)
+    results = []
+    for r in q.all():
+        results.append(PostOut(
+            id=r.id, source=r.source, author=r.author, text=r.text,
+            timestamp=r.timestamp, metrics=r.metrics, sentiment=r.sentiment
+        ))
+    db.close()
+    return results
+
+@app.get("/posts/summary")
+def summary():
+    """
+    Simple summary: counts per source and sentiment breakdown
+    """
+    db = SessionLocal()
+    total = db.query(Post).count()
+    from sqlalchemy import func
+    counts = db.query(Post.source, func.count(Post.id)).group_by(Post.source).all()
+    sentiment_counts = db.query(Post.sentiment, func.count(Post.id)).group_by(Post.sentiment).all()
+    db.close()
+    return {"total": total, "by_source": dict(counts), "by_sentiment": dict(sentiment_counts)}
+
+@app.post("/fetch_now")
+def fetch_now(background_tasks: BackgroundTasks):
+    # run one-off fetch
+    background_tasks.add_task(do_fetch_cycle)
+    return {"status": "ok", "message": "Fetch started in background"}
+
+@app.get("/post/{post_id}", response_model=PostOut)
+def get_post(post_id: str):
+    db = SessionLocal()
+    p = db.query(Post).filter(Post.id == post_id).first()
+    db.close()
+    if not p:
+        raise HTTPException(status_code=404, detail="Post not found")
+    return PostOut(id=p.id, source=p.source, author=p.author, text=p.text, timestamp=p.timestamp, metrics=p.metrics, sentiment=p.sentiment)
